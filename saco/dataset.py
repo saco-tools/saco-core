@@ -14,6 +14,7 @@ import datetime
 import numpy as np
 import pandas as pd
 import networkx as nx
+import scipy.sparse as sp
 
 from .tables import (
     Table, DataTable, IntegratedWBs_NBB, QNaturalFlows_NBB, AbsSensBands_NBB,
@@ -103,6 +104,7 @@ class Dataset:
 
         self._graph = None
         self._routing_matrix = None
+        self._routing_matrix_sparse = None
         self._adjacency_matrix = None
 
     def __deepcopy__(self, memo):
@@ -114,7 +116,10 @@ class Dataset:
         mutating in place.
 
         """
-        for attr in ('_graph', '_routing_matrix', '_adjacency_matrix'):
+        for attr in (
+                '_graph', '_routing_matrix', '_routing_matrix_sparse',
+                '_adjacency_matrix',
+        ):
             value = self.__dict__.get(attr)
             if value is not None:
                 memo[id(value)] = value
@@ -257,6 +262,7 @@ class Dataset:
         if routing_matrix is None:
             routing_matrix = construct_routing_matrix(self.graph)
         self._routing_matrix = routing_matrix
+        self._routing_matrix_sparse = None
 
     def write_tables(
             self, output_folder: Union[Path, str], overwrite: bool = False,
@@ -409,11 +415,18 @@ class Dataset:
         """
         # First identify outlet waterbodies without reference to waterbody type - this
         # is a first-pass if assessed_outlets_only is True, but a final-pass if not
-        outlet_waterbodies = []
-        for waterbody in list(self.graph.nodes):
-            downstream_waterbodies = list(nx.descendants(self.graph, waterbody))
-            if len(downstream_waterbodies) == 0:
-                outlet_waterbodies.append(waterbody)
+        def find_outlets(graph):
+            if nx.is_directed_acyclic_graph(graph):
+                return [
+                    waterbody for waterbody, degree in graph.out_degree()
+                    if degree == 0
+                ]
+            return [
+                waterbody for waterbody in graph.nodes
+                if len(nx.descendants(graph, waterbody)) == 0
+            ]
+
+        outlet_waterbodies = find_outlets(self.graph)
 
         if assessed_outlets_only:
             # For any given outlet, work back upstream and stop at the first assessed
@@ -438,12 +451,7 @@ class Dataset:
                 if len(_wbs_to_remove) > 0:
                     _graph.remove_nodes_from(_wbs_to_remove)
 
-                    _new_outlet_wbs = []
-                    for wb in list(_graph.nodes):
-                        downstream_waterbodies = list(nx.descendants(_graph, wb))
-                        if len(downstream_waterbodies) == 0:
-                            _new_outlet_wbs.append(wb)
-                    _outlet_wbs = _new_outlet_wbs
+                    _outlet_wbs = find_outlets(_graph)
 
                 else:
                     all_types_ok = True
@@ -1098,6 +1106,12 @@ class Dataset:
         return self._routing_matrix
 
     @property
+    def routing_matrix_sparse(self) -> sp.csr_matrix:
+        if self._routing_matrix_sparse is None:
+            self._routing_matrix_sparse = sp.csr_matrix(self.routing_matrix)
+        return self._routing_matrix_sparse
+
+    @property
     def adjacency_matrix(self) -> np.ndarray:
         return self._adjacency_matrix
 
@@ -1221,6 +1235,7 @@ def subset_dataset_on_wbs(ds: Dataset, waterbodies: List[str]) -> Dataset:
     """
     # Dataframe of waterbodies used to subset other tables
     df_wbs = pd.DataFrame({ds.wbs.index_name: waterbodies}).set_index(ds.wbs.index_name)
+    waterbody_set = set(waterbodies)
 
     ds1 = Dataset()
 
@@ -1246,9 +1261,11 @@ def subset_dataset_on_wbs(ds: Dataset, waterbodies: List[str]) -> Dataset:
                 # waterbodies that are both within the domain - so duplicate rows are
                 # filtered out below
                 for i in range(len(ds.gwabs.impacted_waterbody_columns)):
+                    impacted_wbs = table.data[
+                        ds.gwabs.impacted_waterbody_columns[i]
+                    ]
                     df = table.data.loc[
-                        table.data[ds.gwabs.impacted_waterbody_columns[i]]
-                        .isin(waterbodies)
+                        impacted_wbs.map(waterbody_set.__contains__)
                     ]
                     gwabs_dfs.append(df)
 

@@ -453,7 +453,7 @@ class DataPreparer:
                 )
 
             prop = data[prop_col]
-            keep = valid & wb_str.isin(waterbodies) & (prop > 0.0)
+            keep = valid & wb_str.map(waterbodies.__contains__) & (prop > 0.0)
             parts.append(pd.DataFrame({
                 index_col: data.index[keep.to_numpy()],
                 impact_number_col: i + 1,

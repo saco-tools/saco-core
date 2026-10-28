@@ -1,4 +1,5 @@
 import numpy as np
+import networkx as nx
 
 from saco import Dataset
 
@@ -21,3 +22,22 @@ def test_infer_percentile_impact(data_folder=DATA_FOLDER):
     df = ds.swabs.data.loc[~mask]
     df = df.loc[np.abs(df['SWQ95FLWR'] - df['SWQ95FLWR__ORIGINAL']) >= 1e-02]
     assert df.shape[0] == 0
+
+
+def test_find_outlet_waterbodies_on_acyclic_graph():
+    ds = Dataset()
+    ds.set_graph(nx.DiGraph([('upstream', 'outlet')]))
+
+    assert ds.find_outlet_waterbodies(assessed_outlets_only=False) == ['outlet']
+
+
+def test_find_outlet_waterbodies_preserves_cyclic_graph_behavior():
+    graph = nx.DiGraph([('cycle-a', 'cycle-b'), ('cycle-b', 'cycle-a')])
+    graph.add_edge('self-loop', 'self-loop')
+    graph.add_node('outlet')
+    ds = Dataset()
+    ds.set_graph(graph)
+
+    assert ds.find_outlet_waterbodies(assessed_outlets_only=False) == [
+        'self-loop', 'outlet',
+    ]
