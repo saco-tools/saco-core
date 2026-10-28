@@ -800,51 +800,54 @@ class ArrayBuilder:
 
         """
         arc_index_col = self.swabs.arc_index_column  # common across tables
+        waterbody_col = self.swabs.waterbody_id_column
 
-        self.A_2 = np.zeros((self.n_flows, self.n_arcs))
+        # Row of A_2 for each waterbody (rows follow the order of the flows table, which
+        # may not be "ordered" relative to the arc indexes)
+        flow_wbs = self.flows.data.index
+        wb_to_row = pd.Series(np.arange(self.n_flows), index=flow_wbs)
+        flow_arcs = self.flows.data[arc_index_col].to_numpy(dtype=int)
 
-        # Helper to find the index of a flow arc just relative to all flow arcs, rather
-        # than all arcs (as df_flows may not be "ordered")
-        flow_indexes = np.arange(self.n_flows)
+        rows = []
+        cols = []
+        values = []
 
-        i = 0
-        for waterbody, row in self.flows.data.iterrows():
-            waterbody_col = self.swabs.waterbody_id_column
-            swabs = self.swabs.data.loc[self.swabs.data[waterbody_col] == waterbody]
-            for j in swabs[arc_index_col]:
-                self.A_2[i, j] = 1
+        def add_impacts(df, value):
+            """Impact arcs enter the mass balance of the waterbody they impact."""
+            r = wb_to_row.reindex(df[waterbody_col].to_numpy()).to_numpy()
+            keep = ~np.isnan(r)
+            rows.append(r[keep].astype(int))
+            cols.append(df[arc_index_col].to_numpy(dtype=int)[keep])
+            values.append(np.full(keep.sum(), value, dtype=float))
 
-            gwabs = self.gwabs.data.loc[self.gwabs.data[waterbody_col] == waterbody]
-            for j in gwabs[arc_index_col]:
-                self.A_2[i, j] = 1
+        add_impacts(self.swabs.data, 1.0)
+        add_impacts(self.gwabs.data, 1.0)
 
-            for sup_type in [1, 2]:
-                if sup_type == 1:  # compensation
-                    value = -1
-                elif sup_type == 2:  # abstraction
-                    value = 1
-                else:
-                    raise ValueError(f'Unknown complex impact flag value: {sup_type}')
-                sup = self.sup.data.loc[
-                    (self.sup.data[self.sup.optimise_flag_column] == sup_type)
-                    & (self.sup.data[waterbody_col] == waterbody)
-                ]
-                for j in sup[arc_index_col]:
-                    self.A_2[i, j] = value
+        sup_flag = self.sup.data[self.sup.optimise_flag_column]
+        for sup_type, value in [(1, -1.0), (2, 1.0)]:  # compensation, abstraction
+            add_impacts(self.sup.data.loc[sup_flag == sup_type], value)
 
-            # Outflow occurs at the arc_index of the waterbody itself
-            self.A_2[i, int(row[arc_index_col])] = 1
+        # Outflow occurs at the arc_index of the waterbody itself
+        rows.append(np.arange(self.n_flows))
+        cols.append(flow_arcs)
+        values.append(np.ones(self.n_flows))
 
-            # Then need successor to know it has an inflow from an upstream waterbody
+        # Then need successor to know it has an inflow from an upstream waterbody
+        succ_rows = []
+        succ_cols = []
+        for i, waterbody in enumerate(flow_wbs):
             successors = list(self.graph.successors(waterbody))
             if len(successors) > 0:
-                next_waterbody = successors[0]
-                k = flow_indexes[self.flows.data.index == next_waterbody][0]
-                self.A_2[k, int(row[arc_index_col])] = -1
+                succ_rows.append(wb_to_row[successors[0]])
+                succ_cols.append(flow_arcs[i])
+        rows.append(np.array(succ_rows, dtype=int))
+        cols.append(np.array(succ_cols, dtype=int))
+        values.append(np.full(len(succ_rows), -1.0))
 
-            i += 1
-
-        self.A_2 = sp.csr_matrix(self.A_2)
+        self.A_2 = sp.csr_matrix(
+            (np.concatenate(values), (np.concatenate(rows), np.concatenate(cols))),
+            shape=(self.n_flows, self.n_arcs),
+        )
 
         self.b_2 = self.flows.data[
             self.flows.get_qmod_column(self.constants.sub_abb)
