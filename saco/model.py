@@ -423,49 +423,52 @@ class DataPreparer:
         proportion_col = self.gwabs.proportion_column
         impact_col = self.gwabs.impact_column
 
-        dc = {
-            index_col: [],
-            impact_number_col: [],
-            waterbody_col: [],
-            proportion_col: [],
-            impact_col: [],
-        }
-
         impacted_wb_cols = self.ds_opt.gwabs.impacted_waterbody_columns
         impact_prop_cols = self.ds_opt.gwabs.impact_proportion_columns
         value_col = self.ds_opt.gwabs.get_value_column(self.scenario, self.percentile)
 
-        for idx, row in self.ds_opt.gwabs.data.iterrows():
-            for i in range(len(impacted_wb_cols)):
-                impacted_wb_col = impacted_wb_cols[i]
-                impact_prop_col = impact_prop_cols[i]
+        data = self.ds_opt.gwabs.data
+        waterbodies = set(self.waterbodies)
+        parts = []
+        for i, (wb_col, prop_col) in enumerate(zip(impacted_wb_cols, impact_prop_cols)):
+            wb = data[wb_col].astype(object)
+            blank = wb.isna() | (wb.astype(str).str.strip() == '')
 
-                if (
-                        (row[impacted_wb_col] is None)
-                        or (row[impacted_wb_col].strip() == '')
-                ):
-                    break
-                elif (
-                        row[impacted_wb_col].startswith('AP')
-                        or row[impacted_wb_col].startswith('GB')
-                ):
-                    if row[impacted_wb_col] in self.waterbodies:
-                        if row[impact_prop_col] > 0.0:
-                            dc[index_col].append(idx)
-                            dc[waterbody_col].append(row[impacted_wb_col])
-                            dc[impact_number_col].append(i + 1)
-                            dc[proportion_col].append(row[impact_prop_col] / 100.0)
-                            dc[impact_col].append(
-                                row[value_col] * row[impact_prop_col] / 100.0
-                            )
-                else:
-                    wb = row[impacted_wb_col]
-                    raise ValueError(
-                        f'Unknown waterbody naming convention (expect AP... or GB...): '
-                        f'{wb}'
-                    )
+            # Impacted waterbody columns are filled left to right, so a blank ends the
+            # list of impacted waterbodies for that gwab (but only entries before the
+            # blank are validated)
+            if i == 0:
+                ended = blank
+            else:
+                ended = ended | blank
+            valid = ~ended
 
-        df = pd.DataFrame(dc)
+            wb_str = wb.where(valid, '').astype(str)
+            known = wb_str.str.startswith('AP') | wb_str.str.startswith('GB')
+            bad = valid & ~known
+            if bad.any():
+                raise ValueError(
+                    f'Unknown waterbody naming convention (expect AP... or GB...): '
+                    f'{wb_str[bad].iloc[0]}'
+                )
+
+            prop = data[prop_col]
+            keep = valid & wb_str.isin(waterbodies) & (prop > 0.0)
+            parts.append(pd.DataFrame({
+                index_col: data.index[keep.to_numpy()],
+                impact_number_col: i + 1,
+                waterbody_col: wb_str[keep].to_numpy(),
+                proportion_col: prop[keep].to_numpy() / 100.0,
+                impact_col: data[value_col][keep].to_numpy() * prop[keep].to_numpy() / 100.0,
+            }))
+
+        df = pd.concat(parts, ignore_index=True)
+        # Original loop order: by gwab, then by impact number
+        df['__order'] = df[index_col].map(
+            {k: n for n, k in enumerate(data.index)}
+        )
+        df = df.sort_values(['__order', impact_number_col], kind='stable')
+        df = df.drop(columns='__order').reset_index(drop=True)
         df = df.set_index(self.gwabs.index_name)
 
         self.gwabs.set_data(df)
@@ -581,48 +584,61 @@ class DataPreparer:
         outlet_wbs = [wb for wb in outlet_wbs if wb in self.ds.wbs.data.index]
 
         subdomain_wbs = []  # will contain outlet waterbody ID for each subdomain
+
+        # Positions of the rows impacting each waterbody, so that each subdomain can be
+        # assembled without scanning whole tables
+        def positions_by_waterbody(wb_values):
+            return pd.Series(np.arange(len(wb_values))).groupby(
+                np.asarray(wb_values, dtype=object)
+            ).indices
+
+        swabs_pos = positions_by_waterbody(self.swabs.data[self.swabs.waterbody_id_column])
+        gwabs_pos = positions_by_waterbody(self.gwabs.data[self.gwabs.waterbody_id_column])
+        sup_abs = self.sup.data.loc[self.sup.data[self.sup.optimise_flag_column] == 2]
+        sup_pos = positions_by_waterbody(sup_abs[self.sup.waterbody_id_column])
+
+        swabs_arcs = self.swabs.data[self.swabs.arc_index_column].to_numpy()
+        gwabs_arcs = self.gwabs.data[self.gwabs.arc_index_column].to_numpy()
+        gwabs_props = self.gwabs.data[self.gwabs.proportion_column].to_numpy()
+        gwabs_ids = pd.factorize(self.gwabs.data.index.get_level_values(0))[0]
+        sup_arcs = sup_abs[self.sup.arc_index_column].to_numpy()
+
+        def collect(positions, wbs):
+            found = [positions[wb] for wb in wbs if wb in positions]
+            if len(found) == 0:
+                return np.array([], dtype=int)
+            return np.sort(np.concatenate(found))  # retain table order
+
         for wb in outlet_wbs:
             wbs = self.ds.identify_upstream_waterbodies(wb)
 
             # All abstractions per subdomain
             # - i.e. including complex abstractions, but excluding compensation flows
-            swabs = self.swabs.data.loc[
-                self.swabs.data[self.swabs.waterbody_id_column].isin(wbs)
-            ]
-            gwabs = self.gwabs.data.loc[
-                self.gwabs.data[self.gwabs.waterbody_id_column].isin(wbs)
-            ]
-            sup = self.sup.data.loc[
-                (self.sup.data[self.sup.waterbody_id_column].isin(wbs))
-                & (self.sup.data[self.sup.optimise_flag_column] == 2)
-            ]
-            indices = swabs[self.swabs.arc_index_column].tolist()
-            indices.extend(gwabs[self.gwabs.arc_index_column].tolist())
-            indices.extend(sup[self.sup.arc_index_column].tolist())
+            s_idx = collect(swabs_pos, wbs)
+            g_idx = collect(gwabs_pos, wbs)
+            u_idx = collect(sup_pos, wbs)
+
+            indices = swabs_arcs[s_idx].tolist()
+            indices.extend(gwabs_arcs[g_idx].tolist())
+            indices.extend(sup_arcs[u_idx].tolist())
 
             if len(indices) > 0:
                 subdomain_wbs.append(wb)
                 self.subdomain_indices[('all-abstractions', wb)] = indices
 
                 # Abstractions needed to evaluate equality
-                gwabs_indexes = gwabs.groupby(
-                    gwabs.index.get_level_values(0)
-                )[self.gwabs.arc_index_column].min().to_numpy()
-                if (
-                        gwabs.loc[
-                            (gwabs[self.gwabs.arc_index_column].isin(gwabs_indexes))
-                            & (gwabs[self.gwabs.proportion_column] == 0.0)
-                        ].shape[0] > 0
-                ):
+                g_arcs = gwabs_arcs[g_idx]
+                first_arcs = pd.Series(g_arcs).groupby(gwabs_ids[g_idx]).min().to_numpy()
+                is_first = np.isin(g_arcs, first_arcs)
+                if np.any(is_first & (gwabs_props[g_idx] == 0.0)):
                     raise NotImplementedError(
                         'Not yet handled the case where the first-impacted waterbody '
                         'of a gwab has zero proportion of the total impact.'
                     )
-                gwabs = gwabs.loc[gwabs[self.gwabs.arc_index_column].isin(gwabs_indexes)]
 
-                indices = swabs[self.swabs.arc_index_column].tolist()
-                indices.extend(gwabs[self.gwabs.arc_index_column].tolist())
-                indices.extend(sup[self.sup.arc_index_column].tolist())
+                indices = swabs_arcs[s_idx].tolist()
+                indices.extend(g_arcs[is_first].tolist())
+                indices.extend(sup_arcs[u_idx].tolist())
                 self.subdomain_indices[('unique-abstractions', wb)] = indices
 
         self.subdomain_indices['waterbody-list'] = subdomain_wbs
@@ -877,53 +893,53 @@ class ArrayBuilder:
         # number of constraints
         n_constraints = gwabs.shape[0] - len(ids)
 
-        self.A_3 = np.zeros((n_constraints, self.n_arcs))
-
         proportion_col = self.gwabs.proportion_column
+        arc_col = self.constants.arc_index_column
 
-        j = 0  # constraint number incremented below
-        unique_ids = gwabs.index.unique(0)
-        for unique_id in unique_ids:
-            tmp = gwabs.loc[gwabs.index.get_level_values(0) == unique_id]
+        # Rows are grouped by gwab (in order of first appearance); the first row of each
+        # group is the reference and the remaining rows each define one constraint
+        group_ids = gwabs.index.get_level_values(0)
+        group_codes = pd.factorize(group_ids)[0]
+        props = gwabs[proportion_col].to_numpy(dtype=float)
+        arcs = gwabs[arc_col].to_numpy(dtype=int)
 
-            if tmp[proportion_col].iloc[0] == 0.0:
-                raise NotImplementedError(
-                    'Currently using the first waterbody impacted by a gwab as a '
-                    'reference for forming proportional split ratios: failed due to '
-                    'proportion for first impacted waterbody being zero for gwab '
-                    f'{unique_id}'
-                )
+        order = np.argsort(group_codes, kind='stable')
+        group_codes, props, arcs = group_codes[order], props[order], arcs[order]
+        is_first = np.r_[True, group_codes[1:] != group_codes[:-1]]
+        first_pos = np.flatnonzero(is_first)
+        ref_pos = first_pos[group_codes]  # position of reference row for each row
 
-            # Start with second impacted waterbody for forming constraints, as ratios
-            # (factors) are defined relative to first waterbody, which therefore does not
-            # need a constraint here
-            for i in range(1, tmp.shape[0]):
+        zero_ref = props[first_pos] == 0.0
+        if zero_ref.any():
+            unique_ids = pd.unique(group_ids[order])
+            raise NotImplementedError(
+                'Currently using the first waterbody impacted by a gwab as a '
+                'reference for forming proportional split ratios: failed due to '
+                'proportion for first impacted waterbody being zero for gwab '
+                f'{unique_ids[np.flatnonzero(zero_ref)[0]]}'
+            )
 
-                # Handle case where a waterbody is "impacted" with zero proportion (seen in
-                # WRGIS data)
-                if tmp[proportion_col].iloc[i] > 0.0:
-                    factor = (
-                        1.0 / (tmp[proportion_col].iloc[i] / tmp[proportion_col].iloc[0])
-                    )
-                else:
-                    factor = 0.0
+        c = np.flatnonzero(~is_first)  # one constraint per non-reference row
+        with np.errstate(divide='ignore', invalid='ignore'):
+            factors = np.where(
+                props[c] > 0.0, 1.0 / (props[c] / props[ref_pos[c]]), 0.0,
+            )
 
-                # Place factor into array - so waterbody i will come through as factor * x
-                # and waterbody 0 will come through as -1 * x (and sum should be zero)
-                k0 = tmp[self.constants.arc_index_column].iloc[i]
-                k1 = tmp[self.constants.arc_index_column].iloc[0]
-                self.A_3[j, k0] = factor
-                self.A_3[j, k1] = -1.0
-
-                j += 1
+        # Waterbody i comes through as factor * x and the reference as -1 * x
+        j = np.arange(len(c))
+        self.A_3 = sp.csr_matrix(
+            (
+                np.r_[factors, np.full(len(c), -1.0)],
+                (np.r_[j, j], np.r_[arcs[c], arcs[ref_pos[c]]]),
+            ),
+            shape=(n_constraints, self.n_arcs),
+        )
 
         self.b_3 = np.zeros(n_constraints)
 
         if self.A_3.shape[0] == 0:
-            self.A_3 = np.zeros((1, self.n_arcs))
+            self.A_3 = sp.csr_matrix((1, self.n_arcs))
             self.b_3 = np.zeros(1)
-
-        self.A_3 = sp.csr_matrix(self.A_3)
 
     def construct_costs(self):
         """
