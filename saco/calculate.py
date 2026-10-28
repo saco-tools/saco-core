@@ -17,6 +17,7 @@ from typing import List, Dict
 import numpy as np
 import pandas as pd
 import networkx as nx
+import scipy.sparse as sp
 
 from .tables import DataTable
 from .dataset import Dataset, subset_dataset_on_wbs, subset_dataset_on_columns
@@ -348,7 +349,7 @@ class Calculator:
 
         for value_column in value_columns:
             new_column_name = new_column_names[value_column]
-            y = propagate_quantity(self.ds.routing_matrix, df[value_column])
+            y = propagate_quantity(self.ds.routing_matrix_sparse, df[value_column])
             df1.loc[:, new_column_name] = y
 
         return df1
@@ -649,7 +650,7 @@ class Calculator:
 
 
 def propagate_quantity(
-        routing_matrix: np.ndarray, sub_values: np.ndarray,
+        routing_matrix: np.ndarray | sp.spmatrix, sub_values: np.ndarray,
 ) -> np.ndarray:
     """
     Convert a quantity from "sub" to "ups" by propagating through a waterbody network.
@@ -670,6 +671,9 @@ def propagate_quantity(
         Propagated quantity (ups value) with order matching input arrays.
 
     """
+    if sp.issparse(routing_matrix):
+        return np.asarray(routing_matrix.T @ sub_values).ravel()
+
     # Broadcast sub values to 2d array (same value across each row)
     a = np.broadcast_to(sub_values, routing_matrix.shape).T
 

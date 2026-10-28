@@ -1,7 +1,10 @@
+import numpy as np
 import pandas as pd
 import pytest
+import scipy.sparse as sp
 
 from saco import Dataset, Calculator
+from saco.calculate import propagate_quantity
 
 
 CASE_IDS = ['01', '02']
@@ -33,3 +36,17 @@ def test_calculator_run(case_id, capping_variant, capping_args=None):
     ds_test = calculator.run()
 
     pd.testing.assert_frame_equal(ds_test.mt.data, df_ref, check_like=True)
+
+
+def test_propagate_quantity_sparse_matches_dense():
+    routing_matrix = np.array([
+        [1, 1, 1],
+        [0, 1, 1],
+        [0, 0, 1],
+    ])
+    sub_values = np.array([1.5, 2.0, 3.25])
+
+    dense_result = propagate_quantity(routing_matrix, sub_values)
+    sparse_result = propagate_quantity(sp.csr_matrix(routing_matrix), sub_values)
+
+    np.testing.assert_array_equal(sparse_result, dense_result)
