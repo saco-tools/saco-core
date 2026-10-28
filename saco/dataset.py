@@ -105,6 +105,26 @@ class Dataset:
         self._routing_matrix = None
         self._adjacency_matrix = None
 
+    def __deepcopy__(self, memo):
+        """
+        Deep copy that shares the (read-only) graph and routing matrix with the copy.
+
+        These are large, are never modified in place and so need not be duplicated. To
+        modify either, assign a new object (or copy it explicitly) rather than
+        mutating in place.
+
+        """
+        for attr in ('_graph', '_routing_matrix', '_adjacency_matrix'):
+            value = self.__dict__.get(attr)
+            if value is not None:
+                memo[id(value)] = value
+
+        new = self.__class__.__new__(self.__class__)
+        memo[id(self)] = new
+        for key, value in self.__dict__.items():
+            setattr(new, key, deepcopy(value, memo))
+        return new
+
     def load_tables(
             self, skip_tables: List[str] = None, set_index: bool = False,
             validate: bool = False, optional_tables: List[str] = None,
@@ -1154,19 +1174,33 @@ def construct_routing_matrix(graph: nx.DiGraph):
 
     """
     nodes = list(graph.nodes)
+    n = len(nodes)
 
     adj = nx.adjacency_matrix(graph).todense()
     mod_adj = adj.copy()
 
-    for node in nodes:
-        i = nodes.index(node)
+    if nx.is_directed_acyclic_graph(graph):
+        # Reachability built in reverse topological order: the descendants of a node
+        # are its successors plus all of their descendants
+        position = {node: i for i, node in enumerate(nodes)}
+        reach = np.zeros((n, n), dtype=bool)
+        for node in reversed(list(nx.topological_sort(graph))):
+            i = position[node]
+            for successor in graph.successors(node):
+                j = position[successor]
+                reach[i, j] = True
+                reach[i] |= reach[j]
+        mod_adj[reach] = 1
+    else:
+        for node in nodes:
+            i = nodes.index(node)
 
-        successors = nx.dfs_successors(graph, node)
-        successors = set(list(itertools.chain(*successors.values())))
+            successors = nx.dfs_successors(graph, node)
+            successors = set(list(itertools.chain(*successors.values())))
 
-        idx = [j for j, val in enumerate(nodes) if val in successors]
+            idx = [j for j, val in enumerate(nodes) if val in successors]
 
-        mod_adj[i, idx] = 1
+            mod_adj[i, idx] = 1
 
     np.fill_diagonal(mod_adj, 1)
 
